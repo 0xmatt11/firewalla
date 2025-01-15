@@ -1,4 +1,4 @@
-/*    Copyright 2016-2024 Firewalla Inc.
+/*    Copyright 2016-2025 Firewalla Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -86,7 +86,7 @@ class DeviceHook extends Hook {
       // 0. update a special name key for source
       if (host.from) {
         let skey = `${host.from}Name`;
-        host[skey] = host.bname;
+        host[skey] = host.bname;  // TODO: not every DeviceUpdate event has bname
         host.lastFrom = host.from;
         delete host.from
       }
@@ -171,7 +171,9 @@ class DeviceHook extends Hook {
           let newHost = extend({}, host, { ipv6Addr: newIPv6Addr, lastActiveTimestamp: new Date() / 1000 })
 
           log.debug("DeviceHook:IPv6Update:", JSON.stringify(newIPv6Addr));
-          await hostTool.updateMACKey(newHost) // mac
+          const hostManager = new HostManager();
+          const h = await hostManager.getHostAsync(newHost.mac)
+          await h.update(newHost, true, true)
 
           this.messageBus.publish(HOST_UPDATED, host.mac, newHost);
         }
@@ -299,12 +301,7 @@ class DeviceHook extends Hook {
 
           let vendor = null;
 
-          try {
-            vendor = await this.getVendorInfoAsync(mac);
-          } catch (err) {
-            // do nothing
-            log.error("Failed to get vendor info from cloud", err);
-          }
+          vendor = await this.getVendorInfo(mac);
 
           let v = vendor || host.macVendor || "Unknown";
 
@@ -334,22 +331,17 @@ class DeviceHook extends Hook {
               enrichedHost.name = _.get(networkConfig, ["apc", "assets", mac, "sysConfig", "name"]);
           }
 
-          await hostTool.updateMACKey(enrichedHost);
+          const hostManager = new HostManager();
+          const h = await hostManager.createHost(enrichedHost)
+          if (!sysManager.isMyMac(mac)) {
+            await h.spoof(true);
+          }
 
           if (!event.suppressAlarm) {
             await this.createAlarm(enrichedHost);
           } else {
             log.info("Alarm is suppressed for new device", hostTool.getHostname(enrichedHost));
           }
-          const hostManager = new HostManager();
-          const h = await hostManager.getHostAsync(mac).catch(err => {
-            log.error("Failed to get host after it is detected.");
-          })
-          if (!sysManager.isMyMac(mac)) {
-            await h.spoof(true);
-          }
-          await h.update(enrichedHost, true)
-          await h.save()
 
           this.messageBus.publish("DiscoveryEvent", "Device:Create", mac, enrichedHost);
         } catch (err) {
@@ -412,14 +404,11 @@ class DeviceHook extends Hook {
             }
           }
 
-          await hostTool.updateMACKey(enrichedHost); // mac
-
-
-          log.info("MAC entry is updated with new IP");
-
-          log.info(`Reload host info for new ip address ${host.ipv4Addr}`)
           const hostManager = new HostManager()
           const h = await hostManager.getHostAsync(host.mac)
+          await h.update(enrichedHost, true, true)
+          log.info("MAC entry is updated with new IP", host.ipv4Addr);
+
           if (h && h.isMonitoring() && !sysManager.isMyMac(host.mac)) {
             await h.spoof(true);
           }
@@ -494,8 +483,6 @@ class DeviceHook extends Hook {
             }
           }
 
-          await hostTool.updateMACKey(enrichedHost);
-
           // Fix to firewalla/firewalla.ios#991
           //
           // This might cause one device disappear from app as the flow/host list on app is
@@ -505,14 +492,13 @@ class DeviceHook extends Hook {
           // which could only be fix once flow is associated with mac address
           await hostTool.removeDupIPv4FromMacEntry(event.oldMac, host.ipv4Addr, host.mac);
 
-          log.info("MAC entry is updated with new IP");
-
-          log.info(`Reload host info for new ip address ${host.ipv4Addr}`);
           const hostManager = new HostManager();
           const h = await hostManager.getHostAsync(host.mac)
+          await h.update(enrichedHost, true, true)
           if (h && h.isMonitoring() && !sysManager.isMyMac(host.mac)) {
             await h.spoof(true);
           }
+          log.info("MAC entry is updated with new IP", host.ipv4Addr);
 
           this.messageBus.publish(HOST_UPDATED, host.mac, enrichedHost);
         } catch (err) {
@@ -581,13 +567,12 @@ class DeviceHook extends Hook {
 
           const hostManager = new HostManager();
           const h = await hostManager.getHostAsync(mac)
+          await h.update(enrichedHost, true, true)
           if (h && h.isMonitoring() && !sysManager.isMyMac(mac)) {
             await h.spoof(true);
           }
-          await h.update(enrichedHost, true)
-          await h.save()
           // publish device updated event to trigger
-          this.messageBus.publish(HOST_UPDATED, h.mac, h.o);
+          this.messageBus.publish(HOST_UPDATED, mac, h.o);
         })().catch((err) => {
           log.error("Failed to create host entry:", err, err.stack);
         });
@@ -769,40 +754,26 @@ class DeviceHook extends Hook {
     }
   }
 
-  getVendorInfoAsync(mac) {
-    return new Promise((resolve, reject) => {
-      this.getVendorInfo(mac, (err, vendorInfo) => {
-        if (err) {
-          reject(err);
-        } else {
-          resolve(vendorInfo);
-        }
-      })
-    })
-  }
-
-  getVendorInfo(mac, callback) {
-    mac = mac.toUpperCase();
-    let rawData = {
-      ou: mac.slice(0, 13), // use 0,13 for better OU compatibility
-      uuid: flowUtil.hashMac(mac)
-    };
-    bone.device("identify", rawData, (err, enrichedData) => {
-      if (err) {
-        log.error("Failed to get vendor info for mac " + mac + ": " + err);
-        callback(err);
-        return;
-      }
+  async getVendorInfo(mac) {
+    try {
+      mac = mac.toUpperCase();
+      let rawData = {
+        ou: mac.slice(0, 13), // use 0,13 for better OU compatibility
+        uuid: flowUtil.hashMac(mac)
+      };
+      const enrichedData = await bone.deviceAsync("identify", rawData)
 
       if (enrichedData && enrichedData._vendor) {
         let v = enrichedData._vendor;
         if (v.startsWith('"'))
           v = v.slice(1); // workaround for buggy code, vendor has a unless prefix "
-        callback(null, v);
-      } else {
-        callback(null, null);
+        return v
       }
-    });
+    } catch (err) {
+      log.error("Failed to get vendor info from cloud", err);
+    }
+
+    return require('../sensor/NmapSensor.js').getOUI(mac)
   }
 }
 

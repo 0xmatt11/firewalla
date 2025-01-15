@@ -1,4 +1,4 @@
-/*    Copyright 2016-2024 Firewalla Inc.
+/*    Copyright 2016-2025 Firewalla Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -31,15 +31,14 @@ const Constants = require('../net2/Constants.js');
 const fc = require('../net2/config.js')
 const conntrack = require('../net2/Conntrack.js')
 const LogReader = require('../util/LogReader.js');
-const {getUniqueTs, delay} = require('../util/util.js');
+const { delay } = require('../util/util.js');
+const { getUniqueTs } = require('../net2/FlowUtil.js')
 const FireRouter = require('../net2/FireRouter.js');
 
 const { Address4, Address6 } = require('ip-address');
 const exec = require('child-process-promise').exec;
 const _ = require('lodash');
 const sl = require('./SensorLoader.js');
-const FlowAggrTool = require('../net2/FlowAggrTool.js');
-const flowAggrTool = new FlowAggrTool();
 const Message = require('../net2/Message.js');
 
 const LOG_PREFIX = Constants.IPTABLES_LOG_PREFIX_AUDIT
@@ -63,7 +62,6 @@ class ACLAuditLogPlugin extends Sensor {
 
     this.featureName = "acl_audit";
     this.buffer = {}
-    this.bufferTs = Date.now() / 1000
     this.touchedKeys = {};
     this.incTs = 0;
   }
@@ -108,8 +106,9 @@ class ACLAuditLogPlugin extends Sensor {
     const descriptor = this.getDescriptor(record)
     if (this.buffer[mac][descriptor]) {
       const s = this.buffer[mac][descriptor]
-      // _.min() and _.max() will ignore non-number values
+      // _.min() and _.max() ignore non-number values
       s.ts = _.min([s.ts, record.ts])
+      s._ts = _.max([s._ts, record._ts])
       s.du = Math.round((_.max([s.ts + (s.du || 0), record.ts + (record.du || 0)]) - s.ts) * 100) / 100
       s.ct += record.ct
       if (s.sp) s.sp = _.uniq(s.sp, record.sp)
@@ -149,7 +148,7 @@ class ACLAuditLogPlugin extends Sensor {
     if (!content || content.length == 0)
       return;
     const params = content.split(' ');
-    const record = { ts, type: 'ip', ct: 1 };
+    const record = { ts, type: 'ip', ct: 1, _ts: getUniqueTs(ts) };
     record.ac = "block";
     let mac, srcMac, dstMac, inIntf, outIntf, intf, localIP, src, dst, sport, dport, dir, ctdir, security, tls, mark, routeMark, wanUUID, inIntfName, outIntfName, isolationTagId, isolationNetworkIdPrefix;
     for (const param of params) {
@@ -645,6 +644,7 @@ class ACLAuditLogPlugin extends Sensor {
           }
         }
       }
+      record._ts = getUniqueTs(record.ts || Date.now()/1000)
       this._processDnsRecord(record);
     }
   }
@@ -655,7 +655,7 @@ class ACLAuditLogPlugin extends Sensor {
 
   async writeLogs() {
     try {
-      log.debug('Start writing logs', this.bufferTs)
+      // log.debug('Start writing logs')
       // log.debug(JSON.stringify(this.buffer))
 
       const buffer = this.buffer
@@ -665,10 +665,8 @@ class ACLAuditLogPlugin extends Sensor {
       for (const mac in buffer) {
         for (const descriptor in buffer[mac]) {
           const record = buffer[mac][descriptor];
-          const { type, ac, ts, du, ct } = record
+          const { type, ac, _ts, ct } = record
           const intf = record.intf && networkProfileManager.prefixMap[record.intf]
-          const _ts = getUniqueTs(ts + (du || 0)) // make it unique to avoid missing flows in time-based query
-          record._ts = _ts;
           const block = type == 'dns' ?
             record.rc == 3 /*NXDOMAIN*/ &&
             (record.qt == 1 /*A*/ || record.qt == 28 /*AAAA*/) &&
@@ -738,8 +736,7 @@ class ACLAuditLogPlugin extends Sensor {
           if (!mac.startsWith(Constants.NS_INTERFACE + ":"))
             multi.zadd("deviceLastFlowTs", _ts, mac);
           this.touchedKeys[key] = 1;
-          const expires = this.config.expires || 86400
-          multi.expireat(key, parseInt(Date.now() / 1000) + expires)
+          // no need to set ttl here, OldDataCleanSensor will take care of it
           await multi.execAsync()
 
           block && sem.emitLocalEvent({
@@ -774,7 +771,7 @@ class ACLAuditLogPlugin extends Sensor {
       this.touchedKeys = {};
       log.debug('Key(mac) count: ', auditKeys.length)
       for (const key of auditKeys) {
-        const records = await rclient.zrangebyscoreAsync(key, start, end)
+        const records = await rclient.zrangebyscoreAsync(key, '('+start, end)
         // const mac = key.substring(11) // audit:drop:<mac>
 
         const stash = {}
@@ -787,6 +784,7 @@ class ACLAuditLogPlugin extends Sensor {
               const s = stash[descriptor]
               // _.min() and _.max() will ignore non-number values
               s.ts = _.min([s.ts, record.ts])
+              s._ts = _.max([s._ts, record._ts])
               s.du = Math.round((_.max([s.ts + (s.du || 0), record.ts + (record.du || 0)]) - s.ts) * 100) / 100
               s.ct += record.ct
               if (s.sp) s.sp = _.uniq(s.sp, record.sp)
@@ -799,20 +797,18 @@ class ACLAuditLogPlugin extends Sensor {
         }
 
         const transaction = [];
-        transaction.push(['zremrangebyscore', key, start, end]);
+        transaction.push(['zremrangebyscore', key, '('+start, end]);
         for (const descriptor in stash) {
           const record = stash[descriptor]
-          record._ts = getUniqueTs(record.ts + (record.du || 0));
           transaction.push(['zadd', key, record._ts, JSON.stringify(record)])
         }
-        const expires = parseInt(Date.now() / 1000) + (this.config.expires || 86400)
-        transaction.push(['expireat', key, expires])
+        // no need to set ttl here, OldDataCleanSensor will take care of it
 
         // catch this to proceed onto the next iteration
         try {
           log.debug(transaction)
-          await rclient.multi(transaction).execAtomicAsync();
-          log.debug("Audit:Save:Removed", key);
+          await rclient.pipelineAndLog(transaction)
+          log.debug("Audit:Save:Aggregated", key);
         } catch (err) {
           log.error("Audit:Save:Error", err);
         }

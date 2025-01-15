@@ -1,4 +1,4 @@
-/*    Copyright 2016-2024 Firewalla Inc.
+/*    Copyright 2016-2025 Firewalla Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -61,6 +61,9 @@ const linux = require('../util/linux.js');
 
 const l2 = require('../util/Layer2.js');
 
+const CategoryUpdater = require('../control/CategoryUpdater.js')
+const categoryUpdater = new CategoryUpdater()
+
 const timeSeries = require("../util/TimeSeries.js").getTimeSeries()
 
 const sem = require('../sensor/SensorEventManager.js').getInstance();
@@ -77,12 +80,11 @@ const NetworkProfileManager = require('./NetworkProfileManager.js')
 const _ = require('lodash');
 const fsp = require('fs').promises;
 
-const {formulateHostname, isDomainValid, delay, getUniqueTs} = require('../util/util.js');
+const {formulateHostname, isDomainValid, delay} = require('../util/util.js');
+const { getUniqueTs } = require('./FlowUtil.js')
 
 const LRU = require('lru-cache');
-const FlowAggrTool = require('./FlowAggrTool.js');
 const Constants = require('./Constants.js');
-const flowAggrTool = new FlowAggrTool();
 
 const TYPE_MAC = "mac";
 const TYPE_VPN = "vpn";
@@ -525,7 +527,7 @@ class BroDetect {
         }
       } else {
         if (sysManager.isMyMac(localMac)) {
-          log.verbose("Discard incorrect local MAC from DNS log: ", localMac, dnsFlow.sh);
+          log.debug("Discard incorrect local MAC from DNS log: ", localMac, dnsFlow.sh);
           localMac = null
         }
 
@@ -572,7 +574,6 @@ class BroDetect {
       await rclient.zaddAsync(key, dnsFlow._ts, JSON.stringify(dnsFlow)).catch(
         err => log.error("Failed to save single DNS flow: ", dnsFlow, err)
       )
-      if (config.dns.expires) rclient.expireat(key, Date.now() / 1000 + config.dns.expires, ()=>{})
 
       const flowspecKey = `${localMac}:${dnsFlow.dn}:${intfInfo ? intfInfo.uuid : ''}`;
       // add keys to flowstash (but not redis)
@@ -625,7 +626,7 @@ class BroDetect {
       if (cached) this.dnsHit ++
       const cacheHit = cached && obj.answers.every(as => cached.has(as))
       if (cacheHit) {
-        if (this.dnsMatch++ % 10 == 0) log.verbose(`Duplicated DNS ${this.dnsMatch} / ${this.dnsHit} / ${this.dnsCount} `)
+        // if (this.dnsMatch++ % 10 == 0) log.verbose(`Duplicated DNS ${this.dnsMatch} / ${this.dnsHit} / ${this.dnsCount} `)
         log.debug("processDnsData:DNS:Duplicated:", obj['query'], JSON.stringify(obj['answers']));
       } else {
         this.dnsCache.set(cacheKey, new Set(obj.answers))
@@ -772,7 +773,7 @@ class BroDetect {
     return this.isMonitoring(intf, monitorable)
   }
 
-  validateConnData(obj) {
+  async validateConnData(obj) {
     const threshold = config.threshold;
     const iptcpRatio = threshold.IPTCPRatio || 0.1;
 
@@ -827,7 +828,9 @@ class BroDetect {
       }
     }
 
-    if (obj.proto == "tcp") {
+    // this is a very old check, assume it was added for something in spoof mode
+    // FTP data channel would fail this check and never get logged
+    if (obj.proto == "tcp" && await mode.isSpoofModeOn()) {
       if (obj.resp_bytes > threshold.tcpZeroBytesResp && obj.orig_bytes == 0 && obj.conn_state == "SF") {
         log.error("Conn:Adjusted:TCPZero", obj.conn_state, obj);
         return false
@@ -932,7 +935,7 @@ class BroDetect {
       }
 
       // when reversed, number on long conn is substraced and might fail here
-      if (!reverseLocal && !this.validateConnData(obj)) {
+      if (!reverseLocal && !await this.validateConnData(obj)) {
         return;
       }
 
@@ -1081,7 +1084,7 @@ class BroDetect {
         // local flow only available in router mode, so gateway is always Firewalla's mac
         // for non-local flows, this only happens in simple mode
         if (localMac && sysManager.isMyMac(localMac)) {
-          log.verbose("Discard incorrect local MAC address from bro log: ", localMac, lhost);
+          log.debug("Discard incorrect local MAC address from bro log: ", localMac, lhost);
           localMac = null; // discard local mac from bro log since it is not correct
         }
 
@@ -1210,7 +1213,7 @@ class BroDetect {
         } else {
           if (dstMac && sysManager.isMyMac(dstMac)) {
             // double check dest mac for spoof leak
-            log.verbose("Discard incorrect dest MAC address from bro log: ", dstMac, dhost);
+            log.debug("Discard incorrect dest MAC address from bro log: ", dstMac, dhost);
             dstMac = null
           }
 
@@ -1391,7 +1394,7 @@ class BroDetect {
 
       const multi = rclient.multi()
       multi.zadd(redisObj)
-      if (config.conn.expires) multi.expireat(key, now + config.conn.expires, ()=>{})
+      // no need to set ttl here, OldDataCleanSensor will take care of it
       multi.zadd("deviceLastFlowTs", now, localMac);
       await multi.execAsync().catch(
         err => log.error("Failed to save tmpspec: ", tmpspec, err)
@@ -1487,9 +1490,8 @@ class BroDetect {
   async rotateFlowStash(type) {
     const flowstash = this.flowstash[type]
     this.flowstash[type] = {}
-    const end = Date.now() / 1000
+    let end = Date.now() / 1000
     const start = this.lastRotate[type]
-    this.lastRotate[type] = end
 
     // Every FLOWSTASH_EXPIRES seconds, save aggregated flowstash into redis and empties flowstash
     let stashed = {};
@@ -1517,6 +1519,8 @@ class BroDetect {
       // not storing mac (as it's in key) to squeeze memory
       delete spec.mac
       delete spec.local
+
+      if (spec._ts > end) end = spec._ts
       const strdata = JSON.stringify(spec);
       // _ts is the last time this flowspec is updated
       const redisObj = [key, spec._ts, strdata];
@@ -1529,26 +1533,25 @@ class BroDetect {
     } catch (e) {
       log.error("Error rotating flowstash", specKey, start, end, flowstash[specKey], e);
     }
+    this.lastRotate[type] = end
 
     setTimeout(async () => {
       log.info(`${type}:Save:Summary ${start} ${end}`);
       for (let key in stashed) {
-        let stash = stashed[key];
-        log.debug(`${type}:Save:Summary:Wipe ${key} Resolved To: ${stash.length}`);
+        const stash = stashed[key];
+        log.verbose(`${type}:Save:Wipe ${key} Resolved To: ${stash.length}`);
 
         let transaction = [];
-        transaction.push(['zremrangebyscore', key, start, end]);
+        transaction.push(['zremrangebyscore', key, '('+start, end]);
         stash.forEach(robj => {
           if (robj._ts < start || robj._ts > end) log.warn('Stashed flow out of range', start, end, robj)
           transaction.push(['zadd', robj])
         })
-        if (config[type].expires) {
-          transaction.push(['expireat', key, Date.now() / 1000 + config[type].expires])
-        }
+        // no need to set ttl here, OldDataCleanSensor will take care of it
 
         try {
-          await rclient.multi(transaction).execAtomicAsync();
-          log.debug(`${type}:Save:Removed`, key, start, end);
+          await rclient.pipelineAndLog(transaction)
+          log.verbose(`${type}:Save:Done`, key, start, end);
         } catch (err) {
           log.error(`${type}:Save:Error`, err);
         }
@@ -1807,9 +1810,6 @@ class BroDetect {
         let redisObj = [key, obj.ts, strdata];
         log.debug("Notice:Save", redisObj);
         await rclient.zaddAsync(redisObj);
-        if (config.notice.expires) {
-          await rclient.expireatAsync(key, parseInt((+new Date) / 1000) + config.notice.expires);
-        }
         let lh = null;
         let dh = null;
 
@@ -1853,10 +1853,33 @@ class BroDetect {
 
   async processSignatureData(data) {
     const obj = JSON.parse(data);
-    const {uid, sig_id} = obj;
+    const {uid, sig_id, src_addr, src_port} = obj;
     if (!uid || !sig_id)
       return;
     this.addConnSignature(uid, sig_id);
+
+    let isVPNSignature = false;
+
+    if (sig_id == "wireguard-second-msg-sig") {
+      log.info("Wireguard handshake signature detected", uid, sig_id, src_addr, src_port);
+      isVPNSignature = true;
+      
+    } else if (sig_id.startsWith("openvpn-server-")) {
+      log.info("openVPN handshake signature detected", uid, sig_id, src_addr, src_port);
+      isVPNSignature = true;
+    }
+
+    if (isVPNSignature) {
+      if (!src_addr || !src_port) {
+        return;
+      }
+      let portObj = {};
+
+      portObj.proto = "udp";
+      portObj.start = src_port;
+      portObj.end = src_port;
+      categoryUpdater.blockAddress("vpn", src_addr, portObj, true);
+    }
   }
 
   async getWanNicStats() {
@@ -1938,7 +1961,7 @@ class BroDetect {
       }
     }
 
-    log.verbose('toRecord', toRecord)
+    log.debug('toRecord', toRecord)
     for (const key in toRecord) {
       const subKey = key == 'global' ? '' : ':' + (key.endsWith('global') ? key.slice(0, -7) : key)
       const download = isRouterMode && key == 'global' ? wanNicRxBytes : toRecord[key].download;

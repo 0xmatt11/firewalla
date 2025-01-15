@@ -734,7 +734,7 @@ class PolicyManager2 {
     let policyKeys = [];
 
     for (let rule of rules) {
-      if (_.isEmpty(rule.tag)) continue;
+      if (_.isEmpty(rule.tag) || rule.type !== "tag") continue;
 
       for (const type of Object.keys(Constants.TAG_TYPE_MAP)) {
         const tagUid = Constants.TAG_TYPE_MAP[type].ruleTagPrefix + tag;
@@ -753,6 +753,9 @@ class PolicyManager2 {
   
             log.info('remove scope from policy:' + rule.pid, tag);
           }
+        }
+        if (rule.type === "tag" && rule.target == tag) {
+          this.tryPolicyEnforcement(rule, 'unenforce');
         }
       }      
     }
@@ -906,6 +909,9 @@ class PolicyManager2 {
   }
 
   async enforceAllPolicies() {
+    const start = Date.now();
+    const isReboot = await rclient.getAsync(Constants.REDIS_KEY_RUN_REBOOT) == "1";
+
     const rules = await this.loadActivePoliciesAsync({includingDisabled : 1});
 
     const [routeRules, inboundBlockInternetRules, inboundAllowInternetRules, inboundBlockIntranetRules, inboundAllowIntranetRules,
@@ -985,6 +991,8 @@ class PolicyManager2 {
     log.forceInfo(">>>>>==== All policy rules are enforced ====<<<<<", otherRules.length);
 
     await rclient.setAsync(Constants.REDIS_KEY_POLICY_STATE, 'done')
+    const end = Date.now();
+    await rclient.setAsync(Constants.REDIS_KEY_POLICY_ENFORCE_SPENT, JSON.stringify({spend: (end-start)/1000, reboot: isReboot, ts: end/1000}));
 
     const event = {
       type: 'Policy:AllInitialized',
@@ -1012,6 +1020,8 @@ class PolicyManager2 {
   isFirewallaOrCloud(policy) {
     const target = policy.target
     if (!_.isString(target)) return false
+    // target check is only applicable to IP/MAC address or domain
+    if (policy.type && !["ip", "mac", "dns"].includes(policy.type)) return false
     return target && (sysManager.isMyServer(target) ||
       // sysManager.myIp() === target ||
       sysManager.isMyIP(target) ||

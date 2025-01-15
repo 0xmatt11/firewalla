@@ -1,4 +1,4 @@
-/*    Copyright 2020-2024 Firewalla Inc.
+/*    Copyright 2020-2025 Firewalla Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -38,7 +38,10 @@ const sem = require('./SensorEventManager.js').getInstance();
 const PolicyManager2 = require('../alarm/PolicyManager2.js');
 const Policy = require("../alarm/Policy.js");
 const pm2 = new PolicyManager2();
-const SUPPORTED_RULE_TYPES = ["device", "tag", "intranet"];
+const { getUniqueTs } = require('../net2/FlowUtil.js')
+const SUPPORTED_RULE_TYPES = ["device", "tag", "network", "intranet"];
+const Ipset = require('../net2/Ipset.js');
+const platform = require('../platform/PlatformLoader.js').getPlatform();
 
 
 const Sensor = require('./Sensor.js').Sensor;
@@ -51,12 +54,15 @@ class APCMsgSensor extends Sensor {
     this.ssidProfiles = {};
     this.ssidGroupMap = {};
     this.enforcedRules = {};
+    this.assetsIP4s = {};
     sl.initSingleSensor("ACLAuditLogPlugin").then((r) => {this.aclAuditLogPlugin = r}).catch((err) => {
       log.error("Failed to init ACLAuditLogPlugin", this.aclAuditLogPlugin);
     });
   }
 
   async run() {
+    if (!platform.isFireRouterManaged())
+      return;
     await this.loadCachedSSIDProfiles();
     await this.reloadSSIDProfiles();
 
@@ -116,6 +122,13 @@ class APCMsgSensor extends Sensor {
     await this.refreshSSIDSTAMapping().catch((err) => {
       log.error(`Failed to refresh ssid sta mapping`, err.message);
     });
+
+    await this.syncAssetsIPSet().catch((err) => {});
+    setInterval(async () => {
+      this.syncAssetsIPSet().catch((err) => {
+        log.error("Failed to sync assets ipset", err);
+      });
+    }, 60000);
 
     // sync ssid sta mapping once every minute to ensure consistency in case sta update message is missing somehow
     setInterval(async () => {
@@ -177,11 +190,42 @@ class APCMsgSensor extends Sensor {
       return false;
     if (_.isArray(scope) && scope.some(h => !hostTool.isMacAddress(h)))
       return false;
-    if (_.isArray(tag) && tag.some(t => !t.startsWith(Policy.TAG_PREFIX)))
+    if (_.isArray(tag) && tag.some(t => !t.startsWith(Policy.TAG_PREFIX) && !t.startsWith(Policy.INTF_PREFIX)))
       return false;
     if (type === "device" && !hostTool.isMacAddress(target))
       return false;
     return true;
+  }
+
+  async syncAssetsIPSet() {
+    const status = await fwapc.getAssetsStatus().catch((err) => {
+      log.error("Failed to get assets status from fwapc", err.message);
+      return null;
+    });
+    if (!_.isObject(status) || _.isEmpty(status))
+      return;
+    const ip4s = {};
+    for (const uid of Object.keys(status)) {
+      const {addrs} = status[uid];
+      if (!_.isObject(addrs))
+        continue;
+      for (const intf of Object.keys(addrs)) {
+        const {ip4} = addrs[intf];
+        if (ip4)
+          ip4s[ip4] = 1;
+      }
+    }
+    const removedIP4s = Object.keys(this.assetsIP4s).filter(ip => !_.has(ip4s, ip));
+    const newIP4s = Object.keys(ip4s).filter(ip => !_.has(this.assetsIP4s, ip));
+    const ops = [];
+    for (const ip of removedIP4s)
+      ops.push(`del -! ${Ipset.CONSTANTS.IPSET_ASSETS_IP_SET4} ${ip}`);
+    for (const ip of newIP4s)
+      ops.push(`add -! ${Ipset.CONSTANTS.IPSET_ASSETS_IP_SET4} ${ip}`);
+    if (!_.isEmpty(ops))
+      await Ipset.batchOp(ops).catch((err) => {
+        log.error(`Failed to update assets ipset`, err.message);
+      });
   }
 
   async refreshSSIDSTAMapping() {
@@ -194,13 +238,17 @@ class APCMsgSensor extends Sensor {
         return;
 
       const tags = await TagManager.getPolicyTags("ssidPSK");
-      const vlanGroupMap = {};
+      const ssidVlanGroupMap = {};
       const ssidGroupMap = {};
       for (const tag of tags) {
         const ssidPSK = await tag.getPolicyAsync("ssidPSK");
         if (_.isObject(ssidPSK)) {
-          if (_.has(ssidPSK, "vlan"))
-            vlanGroupMap[String(ssidPSK.vlan)] = tag;
+          if (_.has(ssidPSK, "vlan")) {
+            if (_.isObject(ssidPSK.psks)) {
+              for (const uuid of Object.keys(ssidPSK.psks))
+                ssidVlanGroupMap[`${uuid}::${ssidPSK.vlan}`] = tag;
+            }
+          }
           if (_.isArray(ssidPSK.defaultSSIDs)) {
             for (const uuid of ssidPSK.defaultSSIDs)
               ssidGroupMap[uuid] = tag;
@@ -244,8 +292,9 @@ class APCMsgSensor extends Sensor {
           } else {
             if (key.startsWith("vlan:")) { // STA MACs that belong to a PSK group
               const vid = key.substring("vlan:".length);
+              const ssidVlanId = `${uuid}::${vid}`;
               for (const mac of status[key])
-                await this.updateHostSSID(mac.toUpperCase(), uuid, vlanGroupMap[vid] && vlanGroupMap[vid].getUniqueId());
+                await this.updateHostSSID(mac.toUpperCase(), uuid, ssidVlanGroupMap[ssidVlanId] && ssidVlanGroupMap[ssidVlanId].getUniqueId());
             }
           }
         }
@@ -435,7 +484,7 @@ class APCMsgSensor extends Sensor {
       return
     }
     const record = {
-      type: 'ip', ts: msg.ts, ct: msg.ct,
+      type: 'ip', ts: msg.ts, _ts: getUniqueTs(msg.ts), ct: msg.ct,
       sh: msg.src, dh: msg.dst,
       sp: [msg.sport], dp: msg.dport,
       mac: msg.smac, dmac: msg.dmac,
