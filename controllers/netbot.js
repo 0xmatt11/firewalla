@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/*    Copyright 2016-2024 Firewalla Inc.
+/*    Copyright 2016-2025 Firewalla Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -17,7 +17,9 @@
 'use strict'
 
 process.title = "FireApi";
+const net = require('net')
 const _ = require('lodash');
+
 const log = require('../net2/logger.js')(__filename);
 
 const asyncNative = require('../util/asyncNative.js');
@@ -63,6 +65,7 @@ const Constants = require('../net2/Constants.js');
 const flowUtil = require('../net2/FlowUtil');
 
 const iptool = require('ip');
+const ipUtil = require('../util/IPUtil.js');
 const traceroute = require('../vendor/traceroute/traceroute.js');
 
 const rclient = require('../util/redis_manager.js').getRedisClient();
@@ -157,7 +160,6 @@ const Message = require('../net2/Message')
 const util = require('util')
 
 const restartUPnPTask = {};
-const rp = util.promisify(require('request'));
 
 class netBot extends ControllerBot {
 
@@ -174,6 +176,63 @@ class netBot extends ControllerBot {
     nm.loadConfig();
   }
 
+  async _notifyNewEvent(event) {
+    const event_type = event.event_type == "state" ? event.state_type: event.action_type;
+    const event_value = event.event_type == "state" ? event.state_value: event.action_value;
+
+    if (this.hostManager.policy && this.hostManager.policy["notify"]) {
+      if (this.hostManager.policy['notify']['state'] == false) {
+        log.info("host notification disabled");
+        return;
+      }
+
+      if (this.hostManager.policy["notify"][event_type] !== true
+      ) {
+        log.info("host event notification disable for event type", event_type);
+        return;
+      }
+    }
+
+    let notifEvent = await this.getNotifEvent(event_type, event_value, event.labels);
+    if (notifEvent.msg == "") {
+      log.info(`event ${event_type} not supported for notification`);
+      return;
+    }
+    return {
+      type: 'FW_NOTIFICATION',
+      message: notifEvent.msg,
+      titleKey: 'NOTIF_EVENT_TITLE',
+      bodyKey: 'NOTIF_EVENT_BODY',
+      titleLocalKey: `NEW_EVENT_TITLE_${event_type}`,
+      bodyLocalKey: `NEW_EVENT_BODY_${event_type}`,
+      bodyLocalArgs: [notifEvent.args.eid, notifEvent.args.deviceName || "", notifEvent.args.ts || 0 ],
+      bodyLocalMsg: notifEvent.msg,
+      payload: notifEvent.args,
+    }
+  }
+
+  async getNotifEvent(event_type, event_value, event_labels) {
+    let payload = {msg: '', args: {}};
+    switch (event_type) {
+      case "phone_paired":
+        const eid = event_labels.eid;
+        const deviceName = event_labels.deviceName;
+        if (eid == "") return;
+        payload.msg = `A new phone ${deviceName ? "("+deviceName+") " : ""}is paired with your Firewalla box.`;
+        payload.args.eid = eid;
+        payload.args.deviceName = deviceName || "";
+        // find latest event ts
+        let results = await ea.getLatestEventsByType(event_type);
+        results = results.filter(i => i.labels && i.labels.eid == eid);
+        if (results.length > 0) {
+          payload.args.ts = results[0].ts
+        }
+        break;
+      default:
+    }
+    return payload
+  }
+
   async _sendLog() {
     let password = require('../extension/common/key.js').randomPassword(10)
     let filename = this.primarygid + ".tar.gz.gpg";
@@ -185,7 +244,7 @@ class netBot extends ControllerBot {
       const homePath = f.getFirewallaHome();
       let cmdline = `${homePath}/scripts/encrypt-upload-s3.sh ${filename} ${password} '${url.url}'`;
       await execAsync(cmdline).catch(err => {
-        log.error("sendLog: unable to process encrypt-upload", err.message, err.stdout, err.stderr);	
+        log.error("sendLog: unable to process encrypt-upload", err.message, err.stdout, err.stderr);
       })
       return { password: password, filename: path }
     }
@@ -268,6 +327,13 @@ class netBot extends ControllerBot {
 
     let c = require('../net2/MessageBus.js');
     this.messageBus = new c('debug');
+
+    sem.on('Event:NewEvent', async (event) => {
+      let notifEvent = await this._notifyNewEvent(event.event);
+      if (notifEvent) {
+        sem.sendEventToFireApi(notifEvent);
+      }
+    });
 
     sem.on('Alarm:NewAlarm', async (event) => {
       let alarm, notifMsg;
@@ -428,6 +494,10 @@ class netBot extends ControllerBot {
           notifyMsg["loc-args"] = event.bodyLocalArgs;
           notifyMsg["body_loc_args"] = event.bodyLocalArgs;
         }
+      }
+
+      if (event.bodyLocalMsg) {
+        notifyMsg["body_loc_msg"] = event.bodyLocalMsg;
       }
 
       const data = {
@@ -708,8 +778,7 @@ class netBot extends ControllerBot {
         }
         log.info("Changing name", host.o.name);
 
-        await host.update({ name }, true)
-        await host.save(['name', 'localDomain'])
+        await host.update({ name }, true, true)
         this.messageBus.publish(host.constructor.getUpdateCh(), host.getGUID(), { name });
         sem.emitEvent({
           type: "LocalDomainUpdate",
@@ -765,8 +834,7 @@ class netBot extends ControllerBot {
           }
 
           if (customizeDomainName != host.o.customizeDomainName) {
-            await host.update({ customizeDomainName }, true)
-            await host.save(['customizeDomainName', 'userLocalDomain'])
+            await host.update({ customizeDomainName }, true, true)
           }
 
           if (suffix && macAddress == '0.0.0.0') {
@@ -975,6 +1043,17 @@ class netBot extends ControllerBot {
             const date = Math.floor(Date.now() / 1000)
             result["msg"] = `${historyMsg}paired at ${date},`;
             await rclient.hsetAsync("sys:ept:members:history", appInfo.eid, JSON.stringify(result));
+             // notify phone_pair events
+            sem.sendEventToFireApi({
+              type: `Event:NewEvent`,
+              message: "A new event is generated",
+              event: {
+                  "event_type": "action",
+                  "action_type": "phone_paired",
+                  "action_value": 1,
+                  "labels": {"eid": appInfo.eid, "deviceName": appInfo.deviceName}
+              },
+            });
           }
         }
       } catch (err) {
@@ -1367,7 +1446,6 @@ class netBot extends ControllerBot {
         return { categories }
       }
       case "whois": {
-
         const target = value.target;
         let whois = await intelManager.whois(target);
         return { target, whois }
@@ -1450,7 +1528,7 @@ class netBot extends ControllerBot {
               reject(err)
             } else {
               let secondStepIp = hops[1] ? hops[1].ip : "";
-              let isPublic = iptool.isPublic(secondStepIp);
+              let isPublic = ipUtil.isPublic(secondStepIp);
               resolve({ hops: hops, secondStepIp: secondStepIp, isPublic: isPublic, destination: destination })
             }
           })
@@ -1570,6 +1648,7 @@ class netBot extends ControllerBot {
         return resp
       }
       case "branchUpdateTime": {
+        // DO NOT USE: returns branch update time for Red all the time
         const branches = (value && value.branches) || ['beta_6_0', 'release_6_0', 'release_7_0'];
         const result = {};
         for (const branch of branches) {
@@ -1777,7 +1856,7 @@ class netBot extends ControllerBot {
         throw new Error('Invalid target type: ' + type)
     }
 
-    const { audit, nonLocal, local } = msg.data
+    const { audit, nonLocal, local, localAudit } = msg.data
 
     const promises = []
     const tsMetrics = []
@@ -1817,6 +1896,17 @@ class netBot extends ControllerBot {
       if (type != 'host' || target != '0.0.0.0')
         tsMetrics.push('upload:lo', 'download:lo', 'conn:lo:in', 'conn:lo:out')
       hostMetrics.push('upload:lo', 'download:lo', 'conn:lo:in', 'conn:lo:out')
+    }
+    if (fc.isFeatureOn(Constants.FEATURE_LOCAL_AUDIT_LOG) && localAudit) {
+      promises.push(
+        netBotTool.prepareTopFlows(jsonobj, 'local:ipB', "in", Object.assign({}, options, {limit: 400})),
+        netBotTool.prepareTopFlows(jsonobj, 'local:ipB', "out", Object.assign({}, options, {limit: 400})),
+      )
+      if (type != 'host' || target == '0.0.0.0')
+        tsMetrics.push('ipB:lo:intra')
+      if (type != 'host' || target != '0.0.0.0')
+        tsMetrics.push('ipB:lo:in', 'ipB:lo:out')
+      hostMetrics.push('ipB:lo:in', 'ipB:lo:out')
     }
     promises.push(
       this.hostManager.last60MinStatsForInit(jsonobj, target, tsMetrics),
@@ -2429,6 +2519,10 @@ class netBot extends ControllerBot {
         const matchedRule = await pm2.checkACL(value.localMac, value.localPort, value.remoteType, value.remoteVal, value.remotePort, value.protocol, value.direction || "outbound");
         return { matchedRule: matchedRule }
       }
+      case "route:check": {
+        const matchedRoute = await pm2.checkRoute(value.localMac, value.localPort, value.remoteType, value.remoteVal, value.remotePort, value.protocol, value.direction || "outbound");
+        return { matchedRoute: matchedRoute }
+      }
       case "wifi:switch": {
         if (!value.ssid || !value.intf) {
           throw { code: 400, msg: "both 'ssid' and 'intf' should be specified" }
@@ -2589,7 +2683,7 @@ class netBot extends ControllerBot {
         let ip = value.ip
         let name = value.name
 
-        if (iptool.isV4Format(ip)) {
+        if (net.isIPv4(ip)) {
           sem.emitEvent({
             type: "DeviceUpdate",
             message: `Manual submit a new device via API ${ip} ${name}`,
@@ -2942,7 +3036,7 @@ class netBot extends ControllerBot {
         }
         const addr = addrPort[0];
         const port = addrPort[1];
-        if (!iptool.isV4Format(addr) || Number.isNaN(port) || !Number.isInteger(Number(port)) || Number(port) < 0 || Number(port) > 65535) {
+        if (!net.isIPv4(addr) || Number.isNaN(port) || !Number.isInteger(Number(port)) || Number(port) < 0 || Number(port) > 65535) {
           throw { code: 400, msg: "IP address should be IPv4 format and port should be in [0, 65535]" }
         }
         await new VpnManager().killClient(value.addr);
@@ -3257,6 +3351,63 @@ class netBot extends ControllerBot {
         } else {
           throw { code: 404, msg: "device not found" }
         }
+        return
+      }
+      case "host:identify": {
+        const { mac } = value;
+        let hosts = this.hostManager.getHostsFast()
+
+        if (mac) {
+          if (Array.isArray(mac)) {
+            hosts = hosts.filter(h => mac.includes(h.getGUID()))
+            if (hosts.length != mac.length) {
+              throw new Error('Some devices not found')
+            }
+          } else {
+            hosts = [ hosts.find(h => h.getGUID() == mac) ]
+            if (!hosts.length) {
+              throw new Error('Device not found')
+            }
+          }
+        }
+
+        await asyncNative.eachLimit(hosts, 30, async host => {
+          await host.identifyDevice(true)
+        })
+
+        hosts = (await this.hostManager.hostsToJson({}))
+          .filter(j => hosts.some(h => h.getGUID() == j.mac))
+
+        if (!mac || Array.isArray(mac)) {
+          return hosts
+        } else {
+          return hosts[0]
+        }
+      }
+      case "host:classifyDetails": {
+        const { mac } = value;
+        if (!mac) throw new Error('MAC address is required')
+
+        const host = await this.hostManager.getHostAsync(mac)
+        if (!host) throw new Error('Invalid host')
+
+        const result = await host.identifyDevice(true, true)
+        return result
+      }
+      case "host:detect": {
+        const { mac } = value;
+        if (!mac) throw new Error('MAC address is required')
+
+        const host = await this.hostManager.getHostAsync(mac)
+        if (!host) throw new Error('Invalid host')
+
+        sem.emitEvent({
+          type: 'FW_DETECT_REQUEST',
+          message: 'host:detect requested for ' + mac,
+          mac,
+          toProcess: 'FireMon',
+          from: 'host:detect'
+        });
         return
       }
       case "host:syncAppTimeUsageToTags": {
@@ -3594,6 +3745,7 @@ class netBot extends ControllerBot {
   getDefaultResponseDataModel(msg, data, err) {
     let code = 200;
     let message = "";
+    let errID = "";
     if (err) {
       if (_.isEmpty(data) && !_.isEmpty(err.data))
         data = err.data;
@@ -3605,6 +3757,8 @@ class netBot extends ControllerBot {
       if (err && err.msg) {
         message = err.msg;
       }
+      if (err && err.errID)
+        errID = err.errID;
     }
 
     let datamodel = {
@@ -3618,6 +3772,8 @@ class netBot extends ControllerBot {
       data: data,
       message: message
     };
+    if (errID)
+      datamodel.error = errID;
     return datamodel;
   }
 
@@ -3751,14 +3907,14 @@ class netBot extends ControllerBot {
           }
 
           // check whitelist, empty set allows all, only for dev
-          const notAllow = (await rclient.typeAsync('sys:eid:whitelist')) == "set" && !await rclient.sismemberAsync('sys:eid:whitelist', eid || "");
+          const notAllow = (await rclient.typeAsync('sys:eid:whitelist')) == "set" && !await rclient.sismemberAsync('sys:eid:whitelist', eid || "") && msg.appInfo.platform.toLowerCase() != "web";
           if (eid && ["set","cmd"].includes(rawmsg.message.obj.mtype) && !wltargets.includes(msg.data.item) && notAllow){
             log.warn('deny access from eid', eid, "with", msg.data.item);
             return this.simpleTxData(msg, null, { code: 403, msg: "Access Denied. Contact Administrator." }, cloudOptions);
           }
 
           // check blacklist, only for dev
-          const forbid = (await rclient.typeAsync('sys:eid:blacklist')) == "set" && await rclient.sismemberAsync('sys:eid:blacklist', eid || "");
+          const forbid = (await rclient.typeAsync('sys:eid:blacklist')) == "set" && await rclient.sismemberAsync('sys:eid:blacklist', eid || "") && msg.appInfo.platform.toLowerCase() != "web";
           if (eid && ["set","cmd"].includes(rawmsg.message.obj.mtype) && !wltargets.includes(msg.data.item) && forbid){
             log.warn('deny access from eid', eid);
             return this.simpleTxData(msg, null, { code: 403, msg: "Access Denied. Contact Administrator." }, cloudOptions);
